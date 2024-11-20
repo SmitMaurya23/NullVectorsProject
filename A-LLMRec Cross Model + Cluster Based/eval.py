@@ -1,5 +1,7 @@
 import numpy as np
-    
+from sklearn.metrics.pairwise import cosine_similarity
+from sklearn.feature_extraction.text import TfidfVectorizer
+
 def get_answers_predictions(file_path):
     answers = []
     llm_predictions = []
@@ -29,8 +31,15 @@ def get_answers_predictions(file_path):
 def evaluate(answers, llm_predictions, k=1):
     NDCG = 0.0
     HT = 0.0
+    ILD = 0.0
     predict_num = len(answers)
     print(predict_num)
+
+    # Convert llm_predictions to text for ILD calculation
+    llm_text_predictions = [" ".join(pred) for pred in llm_predictions]
+    vectorizer = TfidfVectorizer().fit_transform(llm_text_predictions)
+    vectors = vectorizer.toarray()
+    
     for answer, prediction in zip(answers, llm_predictions):
         if k > 1:
             rank = prediction.index(answer)
@@ -41,8 +50,20 @@ def evaluate(answers, llm_predictions, k=1):
             if answer in prediction:
                 NDCG += 1
                 HT += 1
-                
-    return NDCG / predict_num, HT / predict_num
+        
+        # Calculate ILD for the current prediction list
+        if len(prediction) > 1:
+            dissimilarities = []
+            for i in range(len(prediction)):
+                for j in range(i + 1, len(prediction)):
+                    if i < len(vectors) and j < len(vectors):
+                        dissimilarity = 1 - cosine_similarity([vectors[i]], [vectors[j]])[0][0]
+                        dissimilarities.append(dissimilarity)
+            if dissimilarities:
+                ILD += np.mean(dissimilarities)
+    
+    ILD /= predict_num
+    return NDCG / predict_num, HT / predict_num, ILD
 
 if __name__ == "__main__":
     inferenced_file_path = './recommendation_output.txt'
@@ -50,6 +71,7 @@ if __name__ == "__main__":
     print(len(answers), len(llm_predictions))
     assert(len(answers) == len(llm_predictions))
     
-    ndcg, ht = evaluate(answers, llm_predictions, k=1)
+    ndcg, ht, ild = evaluate(answers, llm_predictions, k=1)
     print(f"ndcg at 1: {ndcg}")
     print(f"hit at 1: {ht}")
+    print(f"ILD: {ild}")

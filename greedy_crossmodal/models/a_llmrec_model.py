@@ -5,11 +5,18 @@ import torch
 from torch.cuda.amp import autocast as autocast
 import torch.nn as nn
 import numpy as np
-
+import torch
+import torch.nn.functional as F
 from models.recsys_model import *
 from models.llm4rec import *
 from sentence_transformers import SentenceTransformer
+import numpy as np
+from sklearn.metrics.pairwise import cosine_similarity
 
+
+
+
+        
    
 
 
@@ -27,11 +34,20 @@ class two_layer_mlp(nn.Module):
         return x, x1
 
 class A_llmrec_model(nn.Module):
+    def cross_modal_attention(self, proj_emb, text_emb):
+     attention_weights = torch.matmul(proj_emb, text_emb.T)
+     attention_weights = F.softmax(attention_weights, dim=-1)
+     attended_text_emb = torch.matmul(attention_weights, text_emb)
+     return attended_text_emb
+
     def __init__(self, args):
         super().__init__()
         rec_pre_trained_data = args.rec_pre_trained_data
         self.args = args
         self.device = args.device
+        self.proj_emb_dim = 50  # Set this to the dimension of proj_emb
+        self.text_proj_layer = torch.nn.Linear(768, self.proj_emb_dim)  # Initialize the text projection layer
+  
         
         with open(f'./data/amazon/{args.rec_pre_trained_data}_text_name_dict.json.gz','rb') as ft:
             self.text_name_dict = pickle.load(ft)
@@ -155,83 +171,110 @@ class A_llmrec_model(nn.Module):
         if mode =='generate':
             self.generate(data)
 
+     
+  
+
+  
+
     def pre_train_phase1(self, data, optimizer, batch_iter):
-     epoch, total_epoch, step, total_step = batch_iter
-    
-     self.sbert.train()
-     optimizer.zero_grad()
+      
+        epoch, total_epoch, step, total_step = batch_iter
 
-     u, seq, pos, neg = data
-     indices = [self.maxlen*(i+1)-1 for i in range(u.shape[0])]
-    
-     with torch.no_grad():
-        log_emb, pos_emb, neg_emb = self.recsys.model(u, seq, pos, neg, mode='item')
-        
-     log_emb_ = log_emb[indices]
-     pos_emb_ = pos_emb[indices]
-     neg_emb_ = neg_emb[indices]
-     pos_ = pos.reshape(pos.size)[indices]
-     neg_ = neg.reshape(neg.size)[indices]
-    
-     start_inx = 0
-     end_inx = 60
-     iterss = 0
-     mean_loss = 0
-     bpr_loss = 0
-     gt_loss = 0
-     rc_loss = 0
-     text_rc_loss = 0
-     original_loss = 0
-     while start_inx < len(log_emb_):
-        log_emb = log_emb_[start_inx:end_inx]
-        pos_emb = pos_emb_[start_inx:end_inx]
-        neg_emb = neg_emb_[start_inx:end_inx]
-        
-        pos__ = pos_[start_inx:end_inx]
-        neg__ = neg_[start_inx:end_inx]
-        
-        start_inx = end_inx
-        end_inx += 60
-        iterss +=1
-        
-        pos_text = self.find_item_text(pos__)
-        neg_text = self.find_item_text(neg__)
-        
-        pos_token = self.sbert.tokenize(pos_text)
-        pos_text_embedding = self.sbert({'input_ids':pos_token['input_ids'].to(self.device),'attention_mask':pos_token['attention_mask'].to(self.device)})['sentence_embedding']
-        neg_token = self.sbert.tokenize(neg_text)
-        neg_text_embedding = self.sbert({'input_ids':neg_token['input_ids'].to(self.device),'attention_mask':neg_token['attention_mask'].to(self.device)})['sentence_embedding']
-        
-        pos_text_matching, pos_proj = self.mlp(pos_emb)
-        neg_text_matching, neg_proj = self.mlp(neg_emb)
-        
-        # Cross-Modal Matching
-        pos_text_matching_text, pos_text_proj = self.mlp2(pos_text_embedding) 
-        neg_text_matching_text, neg_text_proj = self.mlp2(neg_text_embedding)  
-        
-        pos_logits, neg_logits = (log_emb*pos_proj).mean(axis=1), (log_emb*neg_proj).mean(axis=1)
-        pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=neg_logits.device)
+        self.sbert.train()
+        optimizer.zero_grad()
 
-        loss = self.bce_criterion(pos_logits, pos_labels)
-        loss += self.bce_criterion(neg_logits, neg_labels)
-        
-        # Cross-Modal Matching Loss
-        matching_loss = self.mse(pos_text_matching, pos_text_matching_text) + self.mse(neg_text_matching, neg_text_matching_text)
-        reconstruction_loss = self.mse(pos_proj, pos_emb) + self.mse(neg_proj, neg_emb)
-        text_reconstruction_loss = self.mse(pos_text_proj, pos_text_embedding.data) + self.mse(neg_text_proj, neg_text_embedding.data)
-        
-        total_loss = loss + matching_loss + 0.5*reconstruction_loss + 0.2*text_reconstruction_loss
-        total_loss.backward()
-        optimizer.step()
-        
-        mean_loss += total_loss.item()
-        bpr_loss += loss.item()
-        gt_loss += matching_loss.item()
-        rc_loss += reconstruction_loss.item()
-        text_rc_loss += text_reconstruction_loss.item()
-        
-        print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Matching loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss/iterss, bpr_loss/iterss, gt_loss/iterss, rc_loss/iterss, text_rc_loss/iterss))
+        u, seq, pos, neg = data
+        indices = [self.maxlen*(i+1)-1 for i in range(u.shape[0])]
 
+        with torch.no_grad():
+            log_emb, pos_emb, neg_emb = self.recsys.model(u, seq, pos, neg, mode='item')
+
+        log_emb_ = log_emb[indices]
+        pos_emb_ = pos_emb[indices]
+        neg_emb_ = neg_emb[indices]
+        pos_ = pos.reshape(pos.size)[indices]
+        neg_ = neg.reshape(neg.size)[indices]
+
+        start_inx = 0
+        end_inx = 60
+        iterss = 0
+        mean_loss = 0
+        bpr_loss = 0
+        gt_loss = 0
+        rc_loss = 0
+        text_rc_loss = 0
+        original_loss = 0
+        while start_inx < len(log_emb_):
+            log_emb = log_emb_[start_inx:end_inx]
+            pos_emb = pos_emb_[start_inx:end_inx]
+            neg_emb = neg_emb_[start_inx:end_inx]
+
+            pos__ = pos_[start_inx:end_inx]
+            neg__ = neg_[start_inx:end_inx]
+
+            start_inx = end_inx
+            end_inx += 60
+            iterss += 1
+
+            pos_text = self.find_item_text(pos__)
+            neg_text = self.find_item_text(neg__)
+
+            pos_token = self.sbert.tokenize(pos_text)
+            pos_text_embedding = self.sbert({'input_ids': pos_token['input_ids'].to(self.device), 'attention_mask': pos_token['attention_mask'].to(self.device)})['sentence_embedding']
+            neg_token = self.sbert.tokenize(neg_text)
+            neg_text_embedding = self.sbert({'input_ids': neg_token['input_ids'].to(self.device), 'attention_mask': neg_token['attention_mask'].to(self.device)})['sentence_embedding']
+
+            pos_text_matching, pos_proj = self.mlp(pos_emb)
+            neg_text_matching, neg_proj = self.mlp(neg_emb)
+
+            # Project text embeddings to match the dimension of projected embeddings
+            projected_pos_text_embedding = self.text_projection(pos_text_embedding)
+            projected_neg_text_embedding = self.text_projection(neg_text_embedding)
+
+            # Cross-Modal Attention
+            pos_text_attention = self.cross_modal_attention(pos_proj, projected_pos_text_embedding)
+            neg_text_attention = self.cross_modal_attention(neg_proj, projected_neg_text_embedding)
+
+            pos_logits, neg_logits = (log_emb * pos_proj).mean(axis=1), (log_emb * neg_proj).mean(axis=1)
+            pos_labels, neg_labels = torch.ones(pos_logits.shape, device=pos_logits.device), torch.zeros(neg_logits.shape, device=neg_logits.device)
+
+            loss = self.bce_criterion(pos_logits, pos_labels)
+            loss += self.bce_criterion(neg_logits, neg_labels)
+
+            # Cross-Modal Attention Loss
+            attention_loss = self.mse(pos_text_attention, pos_proj) + self.mse(neg_text_attention, neg_proj)
+            reconstruction_loss = self.mse(pos_proj, pos_emb) + self.mse(neg_proj, neg_emb)
+            text_reconstruction_loss = self.mse(pos_text_attention, projected_pos_text_embedding.data) + self.mse(neg_text_attention, projected_neg_text_embedding.data)
+
+            total_loss = loss + attention_loss + 0.5 * reconstruction_loss + 0.2 * text_reconstruction_loss
+            total_loss.backward()
+            optimizer.step()
+
+            mean_loss += total_loss.item()
+            bpr_loss += loss.item()
+            gt_loss += attention_loss.item()
+            rc_loss += reconstruction_loss.item()
+            text_rc_loss += text_reconstruction_loss.item()
+
+        print("loss in epoch {}/{} iteration {}/{}: {} / BPR loss: {} / Attention loss: {} / Item reconstruction: {} / Text reconstruction: {}".format(epoch, total_epoch, step, total_step, mean_loss / iterss, bpr_loss / iterss, gt_loss / iterss, rc_loss / iterss, text_rc_loss / iterss))
+
+    def cross_modal_attention(self, proj_emb, text_emb):
+        # Implement cross-modal attention mechanism
+        attention_weights = torch.matmul(proj_emb, text_emb.T)
+        attention_weights = F.softmax(attention_weights, dim=-1)
+        attended_text_emb = torch.matmul(attention_weights, text_emb)
+        return attended_text_emb
+    
+    def text_projection(self, text_embedding):
+        # Project text embeddings to the same dimension as proj_emb
+        return self.text_proj_layer(text_embedding)
+
+
+
+
+
+
+    
     def make_interact_text(self, interact_ids, interact_max_num):
         interact_item_titles_ = self.find_item_text(interact_ids, title_flag=True, description_flag=False)
         interact_text = []
@@ -327,101 +370,156 @@ class A_llmrec_model(nn.Module):
         mean_loss += loss_rm.item()
         print("A-LLMRec model loss in epoch {}/{} iteration {}/{}: {}".format(epoch, total_epoch, step, total_step, mean_loss))
         
+   
+
+    
+
+
     def generate(self, data):
-        u, seq, pos, neg, rank = data
-        
-        answer = []
-        text_input = []
-        interact_embs = []
-        candidate_embs = []
-        with torch.no_grad():
-            log_emb = self.recsys.model(u,seq,pos,neg, mode = 'log_only')
-            for i in range(len(u)):
-                target_item_id = pos[i]
-                target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
-                
-                interact_text, interact_ids = self.make_interact_text(seq[i][seq[i]>0], 10)
-                candidate_num = 20
-                candidate_text, candidate_ids = self.make_candidate_text(seq[i][seq[i]>0], candidate_num, target_item_id, target_item_title)
-                
-                input_text = ''
-                input_text += ' is a user representation.'
-                if self.args.rec_pre_trained_data == 'Movies_and_TV':
-                    input_text += 'This user has watched '
-                elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text += 'This user has played '
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
-                    input_text += 'This user has bought '
-                    
-                input_text += interact_text
-                
-                if self.args.rec_pre_trained_data == 'Movies_and_TV':
-                    input_text +=' in the previous. Recommend one next movie for this user to watch next from the following movie title set, '
-                elif self.args.rec_pre_trained_data == 'Video_Games':
-                    input_text +=' in the previous. Recommend one next game for this user to play next from the following game title set, '            
-                elif self.args.rec_pre_trained_data == 'Luxury_Beauty' or self.args.rec_pre_trained_data == 'Toys_and_Games':
-                    input_text +=' in the previous. Recommend one next item for this user to buy next from the following item title set, '
-                
-                input_text += candidate_text
-                input_text += '. The recommendation is '
-                
-                answer.append(target_item_title)
-                text_input.append(input_text)
-                
-                interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
-                candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
-        
-        log_emb = self.log_emb_proj(log_emb)
-        atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
-        atts_llm = atts_llm.unsqueeze(1)
-        log_emb = log_emb.unsqueeze(1)
-        
-        with torch.no_grad():
-            self.llm.llm_tokenizer.padding_side = "left"
-            llm_tokens = self.llm.llm_tokenizer(
-                text_input,
-                padding="longest",
-                return_tensors="pt"
-            ).to(self.device)
+     u, seq, pos, neg, rank = data
+    
+     answer = []
+     text_input = []
+     interact_embs = []
+     candidate_embs = []
+     relevance_scores = []  # To store relevance scores
+     with torch.no_grad():
+        log_emb = self.recsys.model(u, seq, pos, neg, mode='log_only')
+        log_emb = self.log_emb_proj(F.normalize(log_emb, p=2, dim=-1))  # Normalize and project log embeddings
+        for i in range(len(u)):
+            target_item_id = pos[i]
+            target_item_title = self.find_item_text_single(target_item_id, title_flag=True, description_flag=False)
             
-            with torch.cuda.amp.autocast():
-                inputs_embeds = self.llm.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            interact_text, interact_ids = self.make_interact_text(seq[i][seq[i] > 0], 10)
+            candidate_num = 20
+            candidate_text, candidate_ids = self.make_candidate_text(seq[i][seq[i] > 0], candidate_num, target_item_id, target_item_title)
+            
+            input_text = ''
+            input_text += ' is a user representation.'
+            if self.args.rec_pre_trained_data == 'Movies_and_TV':
+                input_text += 'This user has watched '
+            elif self.args.rec_pre_trained_data == 'Video_Games':
+                input_text += 'This user has played '
+            elif self.args.rec_pre_trained_data in ['Luxury_Beauty', 'Toys_and_Games']:
+                input_text += 'This user has bought '
                 
-                llm_tokens, inputs_embeds = self.llm.replace_hist_candi_token(llm_tokens, inputs_embeds, interact_embs, candidate_embs)
-                    
-                attention_mask = llm_tokens.attention_mask
-                inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
-                attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
-                    
-                outputs = self.llm.llm_model.generate(
-                    inputs_embeds=inputs_embeds,
-                    attention_mask=attention_mask,
-                    do_sample=False,
-                    top_p=0.9,
-                    temperature=1,
-                    num_beams=1,
-                    max_length=512,
-                    min_length=1,
-                    pad_token_id=self.llm.llm_tokenizer.eos_token_id,
-                    repetition_penalty=1.5,
-                    length_penalty=1,
-                    num_return_sequences=1,
-                )
+            input_text += interact_text
+            input_text += f' in the previous. Recommend one next {self.args.rec_pre_trained_data.lower()} for this user from the following title set: '
+            input_text += candidate_text
+            input_text += '. The recommendation is '
+            
+            answer.append(target_item_title)
+            text_input.append(input_text)
+            
+            interact_embs.append(self.item_emb_proj(self.get_item_emb(interact_ids)))
+            candidate_embs.append(self.item_emb_proj(self.get_item_emb(candidate_ids)))
+            
+            # Compute relevance scores
+            candidate_embs_normalized = F.normalize(candidate_embs[-1], p=2, dim=-1)  # Normalize candidate embeddings
+            scores = torch.matmul(log_emb[i].unsqueeze(0), candidate_embs_normalized.T)
+            relevance_scores.append(scores.squeeze(0).cpu().numpy())
+    
+     atts_llm = torch.ones(log_emb.size()[:-1], dtype=torch.long).to(self.device)
+     atts_llm = atts_llm.unsqueeze(1)
+     log_emb = log_emb.unsqueeze(1)
+    
+     with torch.no_grad():
+        self.llm.llm_tokenizer.padding_side = "left"
+        llm_tokens = self.llm.llm_tokenizer(
+            text_input,
+            padding="longest",
+            return_tensors="pt"
+        ).to(self.device)
+        
+        with torch.cuda.amp.autocast():
+            inputs_embeds = self.llm.llm_model.get_input_embeddings()(llm_tokens.input_ids)
+            
+            llm_tokens, inputs_embeds = self.llm.replace_hist_candi_token(llm_tokens, inputs_embeds, interact_embs, candidate_embs)
+                
+            attention_mask = llm_tokens.attention_mask
+            inputs_embeds = torch.cat([log_emb, inputs_embeds], dim=1)
+            attention_mask = torch.cat([atts_llm, llm_tokens.attention_mask], dim=1)
+                
+            outputs = self.llm.llm_model.generate(
+                inputs_embeds=inputs_embeds,
+                attention_mask=attention_mask,
+                do_sample=False,
+                top_p=0.9,
+                temperature=1,
+                num_beams=1,
+                max_length=512,
+                min_length=1,
+                pad_token_id=self.llm.llm_tokenizer.eos_token_id,
+                repetition_penalty=1.5,
+                length_penalty=1,
+                num_return_sequences=1,
+            )
 
-            outputs[outputs == 0] = 2 # convert output id 0 to 2 (eos_token_id)
-            output_text = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
-            output_text = [text.strip() for text in output_text]
+        outputs[outputs == 0] = 2  # convert output id 0 to 2 (eos_token_id)
+        output_text = self.llm.llm_tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        output_text = [text.strip() for text in output_text]
 
-        for i in range(len(text_input)):
-            f = open(f'./recommendation_output.txt','a')
+    # Apply Greedy Diversification
+     diversified_recommendations = []
+     for i in range(len(relevance_scores)):
+        selected_items = []
+        selected_scores = []
+        candidate_scores = relevance_scores[i]
+        candidate_embeddings = candidate_embs[i].cpu().numpy()
+        
+        for _ in range(candidate_num):
+            if len(selected_items) == 0:
+                # Select the item with the highest relevance score
+                max_index = np.argmax(candidate_scores)
+            else:
+                # Select the item that maximizes both relevance and diversity
+                max_index = None
+                max_score = -np.inf
+                for j in range(len(candidate_scores)):
+                    if j not in selected_items:
+                        diversity_score = np.min([1 - cosine_similarity([candidate_embeddings[j]], [candidate_embeddings[k]])[0][0] for k in selected_items])
+                        combined_score = candidate_scores[j] + diversity_score
+                        if combined_score > max_score:
+                            max_score = combined_score
+                            max_index = j
+            
+            selected_items.append(max_index)
+            selected_scores.append(candidate_scores[max_index])
+        
+        diversified_recommendations.append([candidate_ids[idx] for idx in selected_items])
+
+     for i in range(len(text_input)):
+        with open(f'./recommendation_output.txt', 'a') as f:
             f.write(text_input[i])
             f.write('\n\n')
             
-            f.write('Answer: '+ answer[i])
+            f.write('Answer: ' + answer[i])
             f.write('\n\n')
             
-            f.write('LLM: '+str(output_text[i]))
+            f.write('LLM: ' + str(output_text[i]))
             f.write('\n\n')
-            f.close()
+            
+            f.write('Diversified Recommendations: ' + str(diversified_recommendations[i]))
+            f.write('\n\n')
 
-        return output_text
+     return output_text
+
+
+    
+
+     for i in range(len(text_input)):
+        f = open(f'./recommendation_output.txt', 'a')
+        f.write(text_input[i])
+        f.write('\n\n')
+        
+        f.write('Answer: ' + answer[i])
+        f.write('\n\n')
+        
+        f.write('LLM: ' + str(output_text[i]))
+        f.write('\n\n')
+        
+        
+        f.write('\n\n')
+        f.close()
+
+     return output_text
